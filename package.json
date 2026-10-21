@@ -1,0 +1,23 @@
+{
+  "name": "mcode-bun-distribution",
+  "version": "0.6.12-bun.1",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "packageManager": "bun@1.4.3",
+  "scripts": {
+    "build": "bun scripts/build.mjs",
+    "check": "bun tests/distribution.mjs"
+  },
+  "dependencies": {
+    "@mariozechner/clipboard": "0.3.9",
+    "@vscode/ripgrep": "1.18.0"
+  },
+  "trustedDependencies": [],
+  "mcode": {
+    "upstreamVersion": "0.6.12",
+    "upstreamUrl": "https://registry.npmjs.org/@minimax-ai/code/-/code-0.6.12.tgz",
+    "upstreamSha256": "d8fa59dba7afc3d060367c1bd5b49fb45ed43f846687182e4fea2a1a1f293150",
+    "bunVersion": "1.4.3"
+  }
+}

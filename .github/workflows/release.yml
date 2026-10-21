@@ -1,0 +1,129 @@
+name: Native distribution
+on:
+  push:
+    branches: [main]
+    tags: ['v*-bun.*']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the exact natively checked archives
+        type: boolean
+        default: false
+      public_install_tag:
+        description: Existing release tag to test with the documented public installer
+        type: string
+        default: ''
+permissions:
+  contents: read
+concurrency:
+  group: mcode-release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  native:
+    if: ${{ inputs.public_install_tag == '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: linux-x64
+            scanner: linux_x64.tar.gz
+          - os: windows-2022
+            target: win32-x64
+            scanner: windows_x64.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Locked distribution dependencies and native build
+        shell: bash
+        run: |
+          bun install --frozen-lockfile --ignore-scripts
+          bun scripts/build.mjs
+      - name: SQLite adapter and stock reference
+        shell: bash
+        run: |
+          npm install --prefix .build/reference --no-audit --no-fund better-sqlite3@12.11.1
+          MCODE_TEST_DRIVER="$PWD/runtime/sqlite.cjs" bun tests/sqlite.cjs
+          MCODE_TEST_DRIVER="$PWD/.build/reference/node_modules/better-sqlite3" node tests/sqlite.cjs
+      - name: Delivered runtime, relocation and provider recovery
+        shell: bash
+        run: |
+          bun tests/distribution.mjs
+          candidate=$(bun -e 'console.log(JSON.parse(await Bun.file(".build/latest.json").text()).output)')
+          bun tests/retry.mjs "$candidate/package"
+          if [ "${{ runner.os }}" = Windows ]; then command="$candidate/mcode.exe"; else command="$candidate/mcode"; fi
+          for scenario in recover exhaust compact compact-exhaust; do
+            bun tests/native-retry.mjs "$command" "$scenario"
+          done
+          if [ "${{ runner.os }}" = Linux ]; then bun tests/native-retry.mjs "$command" tui-retry; fi
+      - name: Windows PowerShell 5.1 installer and registration
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $candidate = Get-Content .build/latest.json -Raw | ConvertFrom-Json
+          powershell -NoProfile -ExecutionPolicy Bypass -File tests/windows-install.ps1 -ArchivePath $candidate.archive
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Source and complete release-content secret scan
+        shell: bash
+        run: |
+          mkdir -p .build/scanner
+          curl --fail --location --silent --show-error "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_${{ matrix.scanner }}" -o ".build/scanner/download.${{ runner.os == 'Windows' && 'zip' || 'tar.gz' }}"
+          tar -xf ".build/scanner/download.${{ runner.os == 'Windows' && 'zip' || 'tar.gz' }}" -C .build/scanner
+          if [ "${{ runner.os }}" = Windows ]; then scanner=.build/scanner/gitleaks.exe; else scanner=.build/scanner/gitleaks; fi
+          "$scanner" git . --redact --no-banner
+          candidate=$(bun -e 'console.log(JSON.parse(await Bun.file(".build/latest.json").text()).output)')
+          "$scanner" dir "$candidate" --config .gitleaks.toml --redact --no-banner
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distribution-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+  release:
+    needs: native
+    if: ${{ startsWith(github.ref, 'refs/tags/') || inputs.publish }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.publish.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: distribution-*
+          merge-multiple: true
+          path: dist
+      - name: Publish checked bytes
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          tag="v$(node -p 'require("./package.json").version')"
+          printf '%s\n' 'I publish MiniMax Code 0.6.12 on Bun 1.4.3 with native Windows/Linux distributions, SQLite compatibility and request recovery.' 'Download one complete archive for your OS. See README for Windows installation, repair and uninstall.' 'Native distribution and installer fixtures passed for these exact assets; personal authenticated session acceptance remains separate.' > .release-notes.txt
+          gh release create "$tag" dist/* --target "$GITHUB_SHA" --title "MCode $tag" --notes-file .release-notes.txt
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+  public-windows-install:
+    needs: [release]
+    if: ${{ always() && (needs.release.result == 'success' || inputs.public_install_tag != '') }}
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+      - name: Consumer installation from published GitHub assets
+        shell: powershell
+        env:
+          RELEASE_TAG: ${{ needs.release.outputs.tag || inputs.public_install_tag }}
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File tests/windows-install.ps1 -ReleaseTag $env:RELEASE_TAG
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

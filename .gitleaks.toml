@@ -1,0 +1,22 @@
+title = "MCode Bun secret scanning"
+
+[extend]
+useDefault = true
+
+# Exact non-secret constants examined in the integrity-pinned public npm 0.6.12
+# package: a redacted pagination example, a PDF field identifier, crypto algorithm
+# names/callbacks, a keyboard shortcut, a translation key and a binding guard.
+# No file/directory or arbitrary credential-shaped value is excluded.
+[[allowlists]]
+description = "Audited upstream public examples and code identifiers"
+rules = ["generic-api-key"]
+regexTarget = "match"
+regexes = [
+  '''^page_token": "YhljsPiGfUgnVAg9urvRFd-BvSqRLxxxx"$''',
+  '''^key": "p1-place-of-birth"$''',
+  '''^pbeWithSHAAnd3-KeyTripleDES-CBC","pbewithSHAAnd40BitRC2-CBC"$''',
+  '''^R\.handleClientKeyExchange,fxn=R\.handleCertificateVerify;$''',
+  '''^defaultKeys:"ctrl\+shift\+down"$''',
+  '''^labelKey:"permission\.scope\.byArgvPrefix2"$''',
+  '''^t\.resolvedProjectKey\|\|t\.mutationReceipts===void $''',
+]
