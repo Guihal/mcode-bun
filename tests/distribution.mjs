@@ -5,7 +5,7 @@ import http from 'node:http';
 import assert from 'node:assert/strict';
 import { spawnSync, spawn } from 'node:child_process';
 import { deflateSync } from 'node:zlib';
-import { compile, exact, root, sha256, transform } from '../scripts/build.mjs';
+import { compile, exact, inventory, root, sha256, transform } from '../scripts/build.mjs';
 
 const latestFile = path.join(root, '.build', 'latest.json');
 const latest = fs.existsSync(latestFile) ? JSON.parse(fs.readFileSync(latestFile)) : undefined;
@@ -53,12 +53,21 @@ await check('payload-hashes-no-links-source-drift-refusal', () => {
   }
   assert.throws(() => transform('chunks/chunk-47KWM23C.js', 'unknown source'), /Unsupported upstream|Unsupported pristine/);
   assert.throws(() => exact('source drift', 'missing anchor', 'replacement'), /Unsupported upstream/);
+  const unknown = path.join(scratch, 'unknown-source'); fs.mkdirSync(unknown);
+  fs.writeFileSync(path.join(unknown, 'cli.mjs'), 'const load=require;load(process.env.MANDATORY_DEPENDENCY)');
+  assert.throws(() => inventory(unknown), /Unclassified executable graph/);
 });
 await check('incomplete-archive-fails-before-cli-routing', () => {
   const wasm = path.join(relocated, 'package', 'photon_rs_bg.wasm'), saved = wasm + '.saved';
   fs.renameSync(wasm, saved);
   try { const r = invoke(cli, ['--version']); assert.notEqual(r.status, 0); assert.match(r.stderr, /Incomplete or corrupt.*photon_rs_bg.wasm/); }
   finally { fs.renameSync(saved, wasm); }
+});
+await check('same-size-resource-corruption-fails-before-cli-routing', () => {
+  const wasm = path.join(relocated, 'package', 'photon_rs_bg.wasm'), original = fs.readFileSync(wasm);
+  const corrupt = Buffer.from(original); corrupt[0] ^= 255; fs.writeFileSync(wasm, corrupt);
+  try { const r = invoke(cli, ['--version']); assert.notEqual(r.status, 0); assert.match(r.stderr, /Incomplete or corrupt.*photon_rs_bg.wasm/); }
+  finally { fs.writeFileSync(wasm, original); }
 });
 
 // Compile the same transformed implementations with temporary private exports.

@@ -9,7 +9,8 @@ import { repair } from './retry-repair.mjs';
 export const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const metadata = JSON.parse(fs.readFileSync(path.join(root, 'package.json')));
 export const pin = metadata.mcode;
-export const windows = process.platform === 'win32';
+export const targetPlatform = process.argv.find(arg => arg.startsWith('--target='))?.slice(9).replace(/-x64$/, '') ?? process.platform;
+export const windows = targetPlatform === 'win32';
 export const executableName = windows ? 'mcode.exe' : 'mcode';
 export const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 export function run(command, args, options = {}) {
@@ -204,7 +205,11 @@ const licenseSources = [
     "75815e3bf6484201a3c3d17a1bbf10f2e8e3237f84df10a2357ea896db2a81d6"
   ]
 ];
-const installationSource = `const fs=require('node:fs'),path=require('node:path');
+const installationSource = `const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto');
+function digest(file){
+ const hash=crypto.createHash('sha256'),buffer=Buffer.allocUnsafe(65536),fd=fs.openSync(file,'r');
+ try{let size;while((size=fs.readSync(fd,buffer,0,buffer.length,null))>0)hash.update(buffer.subarray(0,size));return hash.digest('hex')}finally{fs.closeSync(fd)}
+}
 function resolve(){
  const root=fs.realpathSync(path.join(__dirname,'..'));
  const fail=message=>{throw Error('Incomplete or corrupt MCode Bun archive: '+message+'; rerun the distribution installer.')};
@@ -219,7 +224,7 @@ function resolve(){
  if(manifest.schemaVersion!==1||manifest.distribution!=='mcode-bun'||manifest.upstreamVersion!=='0.6.12'||manifest.bunVersion!=='1.4.3'||manifest.target!==process.platform+'-'+process.arch)return fail('unsupported identity or target');
  const packageFile=inside('package/package.json'),pkg=JSON.parse(fs.readFileSync(packageFile,'utf8'));
  if(pkg.name!=='@minimax-ai/code'||pkg.version!==manifest.upstreamVersion)return fail('package identity');
- for(const relative of manifest.required){const file=inside(relative);if(!manifest.files[relative]||fs.statSync(file).size!==manifest.files[relative].size)return fail(relative+' has changed')}
+ for(const relative of manifest.required){const file=inside(relative),expected=manifest.files[relative];if(!expected||fs.statSync(file).size!==expected.size||digest(file)!==expected.sha256)return fail(relative+' has changed')}
  const launcherPath=inside(process.platform==='win32'?'mcode.exe':'mcode'),runtimeExecutable=inside('runtime/'+(process.platform==='win32'?'bun.exe':'bun')),entryFile=inside('package/cli.js');
  return {prefix:root,releasePrefix:root,releaseKey:manifest.release,launcherPath,entryFile,packageName:pkg.name,version:pkg.version,runtimeExecutable,distTag:'latest',manifest};
 }
@@ -274,8 +279,25 @@ export function transform(name, source) {
   return s;
 }
 
-export function compile(entry, output) {
-  console.log(run(process.execPath, ['build', entry, '--compile', '--bytecode', '--format=esm', '--define', '__MCODE_COMPILED__=true', '--outfile', output]).trim());
+export function compile(entry, output, options = {}) {
+  const extra = options.target ? [`--target=${options.target}`, `--compile-executable-path=${options.executablePath}`] : [];
+  console.log(run(process.execPath, ['build', entry, '--compile', '--bytecode', '--format=esm', '--define', '__MCODE_COMPILED__=true', ...extra, '--outfile', output]).trim());
+}
+
+async function windowsRuntime(directory, output) {
+  const archive = path.join(directory, 'bun-windows.zip');
+  const response = await fetch(`https://github.com/oven-sh/bun/releases/download/bun-v${pin.bunVersion}/bun-windows-x64-baseline.zip`);
+  if (!response.ok) throw Error(`Windows Bun download: HTTP ${response.status}`);
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (sha256(bytes) !== 'd7a7d3eb216614544aab0cde2d8d9f2e4e87839bf5a30a1cd11d077f02d84e0c') throw Error('Windows Bun digest mismatch');
+  fs.writeFileSync(archive, bytes);
+  const member = 'bun-windows-x64-baseline/bun.exe';
+  if (process.platform === 'win32') {
+    const script = path.join(directory, 'extract-bun.ps1');
+    fs.writeFileSync(script, 'param($Archive,$Member,$Target)\n$ErrorActionPreference="Stop"\nAdd-Type -AssemblyName System.IO.Compression.FileSystem\n$zip=[IO.Compression.ZipFile]::OpenRead($Archive)\ntry{$entry=$zip.GetEntry($Member);if(-not $entry){throw "Missing pinned Bun executable"};[IO.Compression.ZipFileExtensions]::ExtractToFile($entry,$Target)}finally{$zip.Dispose()}\n');
+    run('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, '-Archive', archive, '-Member', member, '-Target', output]);
+  } else run('python3', ['-c', 'import zipfile,sys,pathlib\nwith zipfile.ZipFile(sys.argv[1]) as z: pathlib.Path(sys.argv[3]).write_bytes(z.read(sys.argv[2]))', archive, member, output]);
+  return output;
 }
 
 async function acquire(directory) {
@@ -293,8 +315,38 @@ async function acquire(directory) {
 // import discovery includes embedded workers; optional skill toolchains are data.
 export function inventory(pkg) {
   const scanner = new Bun.Transpiler({ loader: 'js', target: 'bun' });
-  const imports = [], boundaries = [];
-  for (const file of files(pkg)) {
+  const executableFiles = files(pkg).filter(file => /\.(?:[cm]?js)$/.test(file) && !path.relative(pkg, file).split(path.sep).includes('assets'));
+  // This is an exact-version audit, not a general JavaScript sandbox. Pin the
+  // complete executable graph, including computed/aliased loaders and embedded
+  // script templates. A new file or a change outside scanImports (for example
+  // const load=require;load(variable)) must reopen the audit, never pass empty
+  // import discovery. The npm tarball hash independently authenticates acquisition.
+  const graph = executableFiles.map(file => [path.relative(pkg, file).replaceAll(path.sep, '/'), sha256(fs.readFileSync(file))]);
+  const graphHash = sha256(JSON.stringify(graph));
+  if (graph.length !== 98 || graphHash !== '2520a62f1acb553e4c581aa633a357f2513ccc4538a4124bf2922f8136892d02') throw Error('Unclassified executable graph: aliased/computed runtime boundaries require review');
+  const imports = [], boundaries = [], nativeBindings = [];
+  const owners = {
+    'chunks/chunk-334CV6RF.js': 'upstream npm metadata fallback; archive projection bypasses npm layout',
+    'chunks/chunk-47KWM23C.js': 'provider SDK builtins; configured tool/shell commands; private-Bun Windows trash; clipboard physical loader',
+    'chunks/chunk-5ADYFF2U.js': 'Git operations and optional SDK/IDE/browser/sandbox/plugin commands; bundled ripgrep; private-Bun tools/trash/child runners',
+    'chunks/chunk-DCFP5ZHZ.js': 'upstream activation template; disabled archive activation owner',
+    'chunks/chunk-GMLXHJYG.js': 'physical image worker/WASM, with executable/cwd fallback lookup',
+    'chunks/chunk-X7FQ5SBJ.js': 'upstream installer functions; archive inspect/apply refuses upstream updates',
+    'chunks/chunk-ZPSMBMGA.js': 'OS shells, taskkill and optional terminal probes; private-Bun guardian/eval; physical ripgrep',
+    'chunks/launcher-AVQRYDKB.js': 'compiled application restart; physical native console/worker; configured editor/hook/notification commands',
+    'chunks/run-app-server-command-DEX4FRZJ.js': 'existing daemon manager with archive launcher projection; updater loop refused',
+    'chunks/chunk-25R53L7J.js': 'bundled Commander loader and external-subcommand capability',
+    'chunks/chunk-AMLNR7IO.js': 'optional Google executable authentication and OS credential facilities',
+    'chunks/chunk-HQ2U4QVQ.js': 'bundled cross-spawn command adapter',
+    'chunks/chunk-I2T4QMR7.js': 'bundled logging/thread-stream worker support',
+    'chunks/chunk-I7MLO7YD.js': 'OS process inspection',
+    'chunks/chunk-QXUSWEWV.js': 'OS URL/file opener',
+    'chunks/chunk-VAVHH4XP.js': 'bundled clipboard native loader and OS clipboard fallbacks',
+    'chunks/chunk-X3PES5WL.js': 'optional Git metadata',
+    'embedded/mcode-tools/cli.mjs': 'integrity-preserved broker CLI; bundled SDK builtins and optional OS proxy lookup',
+    'image-preview-worker.js': 'physical worker using private Bun worker_threads',
+  };
+  for (const file of executableFiles) {
     const name = path.relative(pkg, file).replaceAll(path.sep, '/');
     if (!/\.(?:[cm]?js)$/.test(name) || name.startsWith('assets/')) continue;
     const source = fs.readFileSync(file, 'utf8').replace(/^#![^\n]*\n/, '');
@@ -305,12 +357,24 @@ export function inventory(pkg) {
       } else if (!['better-sqlite3', '@mariozechner/clipboard', '@larksuiteoapi/node-sdk'].includes(ref.path)) throw Error(`Unclassified import ${name}: ${ref.path}`);
       imports.push({ file: name, ...ref });
     }
+    // Follow the pinned minified native-import aliases as well as spelled-out
+    // calls. The graph pin covers generated script bodies and bundled CommonJS
+    // require aliases, whose owners are recorded above rather than guessed from
+    // the spelling of an individual call.
+    for (const match of source.matchAll(/import\{([^}]+)\}from["'](?:node:)?(child_process|worker_threads)["']/g)) {
+      const owner = owners[name];
+      if (!owner) throw Error(`Unclassified native runtime owner: ${name}`);
+      for (const binding of match[1].split(',')) {
+        const parts = binding.trim().split(/\s+as\s+/);
+        nativeBindings.push({ file: name, module: match[2], imported: parts[0], local: parts.at(-1), owner });
+      }
+    }
     // Exact pinned bytes prohibit new hidden/dynamic relations. Keep every
     // process/resource boundary in the build report for review and drift checks.
     const pattern = /(?:process\.(?:execPath|argv)|\b(?:spawn|fork|Worker|execFile|createRequire|require|import)\s*\(|--eval|--input-type|\.node["']|\.wasm["']|__mavis_tuiPackageEntryUrl)/g;
-    for (const match of source.matchAll(pattern)) boundaries.push({ file: name, offset: match.index, token: match[0] });
+    for (const match of source.matchAll(pattern)) boundaries.push({ file: name, offset: match.index, token: match[0], owner: owners[name] ?? 'pinned module loader/CLI arguments or bundled SDK builtin; package entry resolves from physical archive' });
   }
-  return { imports, boundaries };
+  return { graphHash, imports, boundaries, nativeBindings };
 }
 
 async function copyLicenses(output) {
@@ -340,7 +404,7 @@ async function copyLicenses(output) {
 }
 
 export async function build() {
-  if (Bun.version !== pin.bunVersion || pin.upstreamVersion !== '0.6.12' || process.arch !== 'x64' || !['linux', 'win32'].includes(process.platform)) throw Error('Build requires pinned Bun 1.4.3 on Windows x64 or Linux x64 glibc');
+  if (Bun.version !== pin.bunVersion || pin.upstreamVersion !== '0.6.12' || process.arch !== 'x64' || !['linux', 'win32'].includes(process.platform) || !['linux', 'win32'].includes(targetPlatform) || (targetPlatform !== process.platform && !windows)) throw Error('Build requires pinned Bun 1.4.3 on Windows/Linux x64; supported cross-target: win32-x64');
   const directory = path.join(root, '.build', crypto.randomUUID());
   fs.mkdirSync(directory, { recursive: true });
   const pkg = await acquire(directory);
@@ -348,7 +412,7 @@ export async function build() {
   if (identity.name !== '@minimax-ai/code' || identity.version !== pin.upstreamVersion) throw Error('Upstream package identity mismatch');
   const discovery = inventory(pkg);
   fs.writeFileSync(path.join(directory, 'inventory.json'), JSON.stringify(discovery, null, 2));
-  const release = `mcode-${metadata.version}-${process.platform}-${process.arch}`;
+  const release = `mcode-${metadata.version}-${targetPlatform}-${process.arch}`;
   const output = path.join(directory, release);
   fs.mkdirSync(path.join(output, 'runtime'), { recursive: true });
   fs.cpSync(pkg, path.join(output, 'package'), { recursive: true, dereference: false });
@@ -356,22 +420,31 @@ export async function build() {
     const name = path.relative(path.join(output, 'package'), file).replaceAll(path.sep, '/');
     if (/\.(?:[cm]?js)$/.test(name) && !name.startsWith('assets/') && name !== 'verify-native-install.mjs') fs.writeFileSync(file, transform(name, fs.readFileSync(file, 'utf8')));
   }
-  fs.cpSync(path.join(root, 'node_modules'), path.join(output, 'package', 'node_modules'), { recursive: true, dereference: true });
+  let dependencyRoot = root;
+  if (targetPlatform !== process.platform) {
+    dependencyRoot = path.join(directory, 'dependencies'); fs.mkdirSync(dependencyRoot);
+    for (const name of ['package.json', 'bun.lock']) fs.copyFileSync(path.join(root, name), path.join(dependencyRoot, name));
+    console.log(run(process.execPath, ['install', '--cwd', dependencyRoot, '--frozen-lockfile', '--ignore-scripts', '--os=win32', '--cpu=x64']).trim());
+  }
+  fs.cpSync(path.join(dependencyRoot, 'node_modules'), path.join(output, 'package', 'node_modules'), { recursive: true, dereference: true });
   // Every dependency must have an exact locked identity; no optional SQLite or
   // lifecycle installer is part of the consumer dependency graph.
   const modules = path.join(output, 'package', 'node_modules');
   const clipboardName = `@mariozechner/clipboard-${windows ? 'win32-x64-msvc' : 'linux-x64-gnu'}`;
-  const ripgrepName = `@vscode/ripgrep-${process.platform}-x64`;
+  const ripgrepName = `@vscode/ripgrep-${targetPlatform}-x64`;
   for (const [name, version] of [['@mariozechner/clipboard', '0.3.9'], [clipboardName, '0.3.9'], ['@vscode/ripgrep', '1.18.0'], [ripgrepName, '1.18.0']]) {
     const p = JSON.parse(fs.readFileSync(path.join(modules, name, 'package.json')));
     if (p.name !== name || p.version !== version) throw Error(`Dependency identity mismatch: ${name}`);
   }
-  fs.copyFileSync(process.execPath, path.join(output, 'runtime', windows ? 'bun.exe' : 'bun'));
+  const privateRuntime = path.join(output, 'runtime', windows ? 'bun.exe' : 'bun');
+  if (windows) await windowsRuntime(directory, privateRuntime);
+  else fs.copyFileSync(process.execPath, privateRuntime);
+  const compileOptions = windows ? { target: 'bun-windows-x64-baseline', executablePath: privateRuntime } : {};
   fs.copyFileSync(path.join(root, 'runtime', 'sqlite.cjs'), path.join(output, 'runtime', 'sqlite.cjs'));
   fs.writeFileSync(path.join(output, 'runtime', 'installation.cjs'), installationSource);
   const bootstrap = path.join(directory, 'bootstrap.mjs');
   fs.writeFileSync(bootstrap, `import path from 'node:path'; import {createRequire} from 'node:module';const root=path.dirname(process.execPath);createRequire(path.join(root,'package','cli.js'))(path.join(root,'runtime','installation.cjs')).resolve();process.argv.splice(1,1,path.join(root,'package','cli.js'));await import('./${release}/package/cli.js');`);
-  compile(bootstrap, path.join(output, executableName));
+  compile(bootstrap, path.join(output, executableName), compileOptions);
   if (windows) {
     const shimEntry = path.join(directory, 'command-shim.mjs');
     fs.writeFileSync(shimEntry, `import fs from 'node:fs';import path from 'node:path';import{createRequire}from'node:module';import{spawnSync}from'node:child_process';
@@ -385,22 +458,27 @@ try{
  const result=spawnSync(command,args,{stdio:'inherit',windowsHide:false});if(result.error)throw result.error;process.exit(result.status??1);
 }catch(error){console.error('MCode Bun: '+error.message+'; rerun the installer.');process.exit(127)}
 `);
-    compile(shimEntry, path.join(output, 'runtime', 'command-shim.exe'));
+    compile(shimEntry, path.join(output, 'runtime', 'command-shim.exe'), compileOptions);
     fs.writeFileSync(path.join(output, 'mcode-tools.cmd'), '@echo off\r\n"%~dp0runtime\\bun.exe" "%~dp0package\\mcode-tools.js" %*\r\nexit /b %errorlevel%\r\n');
   } else fs.writeFileSync(path.join(output, 'mcode-tools'), '#!/bin/sh\nset -eu\nroot=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)\nexec "$root/runtime/bun" "$root/package/mcode-tools.js" "$@"\n', { mode: 0o755 });
   for (const name of ['README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'install.ps1']) fs.copyFileSync(path.join(root, name), path.join(output, name));
   await copyLicenses(output);
-  const manifest = { schemaVersion: 1, distribution: 'mcode-bun', release: metadata.version, upstreamVersion: pin.upstreamVersion, bunVersion: pin.bunVersion, target: `${process.platform}-${process.arch}`, files: {}, required: [executableName, `runtime/${windows ? 'bun.exe' : 'bun'}`, 'runtime/sqlite.cjs', 'package/cli.js', 'package/package.json', 'package/image-preview-worker.js', 'package/photon_rs_bg.wasm', 'package/embedded/mcode-tools/cli.mjs'] };
+  const manifest = { schemaVersion: 1, distribution: 'mcode-bun', release: metadata.version, upstreamVersion: pin.upstreamVersion, bunVersion: pin.bunVersion, target: `${targetPlatform}-${process.arch}`, files: {}, required: [executableName, `runtime/${windows ? 'bun.exe' : 'bun'}`, 'runtime/sqlite.cjs', 'package/cli.js', 'package/package.json', 'package/image-preview-worker.js', 'package/photon_rs_bg.wasm', 'package/embedded/mcode-tools/cli.mjs'] };
   for (const file of files(output)) manifest.files[path.relative(output, file).replaceAll(path.sep, '/')] = { size: fs.statSync(file).size, sha256: sha256(fs.readFileSync(file)) };
   fs.writeFileSync(path.join(output, 'manifest.json'), JSON.stringify(manifest, null, 2));
-  run(path.join(output, executableName), ['--version']);
+  if (targetPlatform === process.platform) run(path.join(output, executableName), ['--version']);
+  if (windows) for (const relative of [executableName, 'runtime/bun.exe', 'runtime/command-shim.exe', `package/node_modules/${clipboardName}/clipboard.win32-x64-msvc.node`, `package/node_modules/${ripgrepName}/bin/rg.exe`]) {
+    const bytes = fs.readFileSync(path.join(output, relative)), pe = bytes.readUInt32LE(0x3c);
+    if (bytes.readUInt16LE(0) !== 0x5a4d || pe + 6 > bytes.length || bytes.readUInt32LE(pe) !== 0x4550 || bytes.readUInt16LE(pe + 4) !== 0x8664) throw Error(`Expected Windows x64 PE: ${relative}`);
+  }
   const dist = path.join(root, 'dist'); fs.mkdirSync(dist, { recursive: true });
   const archive = path.join(dist, `${release}.${windows ? 'zip' : 'tar.gz'}`);
-  if (windows) {
+  if (windows && process.platform === 'win32') {
     const script = path.join(directory, 'archive.ps1');
     fs.writeFileSync(script, 'param([string]$Source,[string]$Target)\n$ErrorActionPreference="Stop"\nAdd-Type -AssemblyName System.IO.Compression.FileSystem\n[System.IO.Compression.ZipFile]::CreateFromDirectory($Source,$Target)\n');
-    run('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', script, '-Source', output, '-Target', archive]);
+    run('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, '-Source', output, '-Target', archive]);
   }
+  else if (windows) run('python3', ['-c', 'import zipfile,pathlib,sys\nroot=pathlib.Path(sys.argv[1])\nwith zipfile.ZipFile(sys.argv[2],"w",zipfile.ZIP_DEFLATED,compresslevel=6) as z:\n for file in sorted(root.rglob("*")):\n  if file.is_file(): z.write(file,file.relative_to(root).as_posix())', output, archive]);
   else run('tar', ['-czf', archive, '-C', output, '.']);
   fs.writeFileSync(archive + '.sha256', `${sha256(fs.readFileSync(archive))}  ${path.basename(archive)}\n`);
   fs.writeFileSync(path.join(root, '.build', 'latest.json'), JSON.stringify({ output, archive, discovery: path.join(directory, 'inventory.json') }));

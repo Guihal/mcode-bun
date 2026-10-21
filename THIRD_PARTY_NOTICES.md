@@ -58,5 +58,3 @@ Additional license texts are supplied in licenses/ by the build.
 Bun statically links LGPL JavaScriptCore. Its upstream license includes
 rebuild/relink instructions: https://github.com/oven-sh/bun/blob/bun-v1.4.3/LICENSE.md.
 This repository can rebuild the application with a rebuilt pinned-version Bun.
-
-самостоятельный чек: bun scripts/build.mjs + ожидаемый вывод: archive contains licenses and retained upstream notices

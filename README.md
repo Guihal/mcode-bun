@@ -5,8 +5,10 @@ compatibility adapter and request recovery. An independent distribution by
 Guihal, based on [MiniMax Code](https://github.com/MiniMax-AI/minimax-code).
 
 The initial build targets are Windows x64 (Windows 10 1809+) and Linux x64
-with glibc. Native checks must pass before release publication. Authenticated
-interactive/model-session acceptance remains a separate user check.
+with glibc. Linux runtime checks are run locally. The Windows archive is
+cross-compiled and has not yet been verified on native Windows; installer and
+runtime fixtures are included for that testing. Authenticated interactive/model
+session acceptance also remains a separate user check.
 
 ## Install on Windows
 
@@ -63,22 +65,30 @@ RAM/performance guarantee is made.
 
 ## Maintainer build and checks
 
-Use Bun 1.4.3 on the target OS:
+Use Bun 1.4.3 on the target OS (plus tar and Python 3 for Linux cross-builds):
 
     bun install --frozen-lockfile --ignore-scripts
     bun scripts/build.mjs
     bun tests/distribution.mjs
+
+To cross-build the complete Windows ZIP on Linux:
+
+    bun scripts/build.mjs --target=win32-x64
+
+This installs locked Windows dependencies in build scratch and downloads a
+SHA-256-pinned official Windows Bun executable. It does not execute Windows
+binaries or establish native Windows compatibility.
 
 The build fetches the exact npm 0.6.12 tarball and checks the SHA-256 in
 [package.json](package.json), applies exact transformations, and installs
 dependencies from [bun.lock](bun.lock). No upstream SQLite postinstall runs.
 Generated trees/archives live in ignored .build/ and dist/; personal installation
 or configuration trees are never imported. [Native CI](.github/workflows/release.yml)
-gates release bytes. Controlled fixtures use disposable data and synthetic
+can build and test future release bytes when hosted runners are available.
+The first Windows release is published for user testing without a native CI pass.
+Controlled fixtures use disposable data and synthetic
 loopback credentials, not an authenticated personal session.
 
 Authored distribution code is MIT. The npm package declares MIT. See
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and the archive's licenses/ for
 upstream and dependency attribution, including Bun's linked libraries.
-
-самостоятельный чек: bun scripts/build.mjs && bun tests/distribution.mjs + ожидаемый вывод: native archive built and distribution cases pass

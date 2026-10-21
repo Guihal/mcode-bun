@@ -45,10 +45,16 @@ function Update-Path([bool]$Remove) {
     [Environment]::SetEnvironmentVariable('Path', ($entries -join ';'), $target)
   }
 }
-function Verify-File([string]$Root, [string]$Relative) {
+function Verify-File([string]$Root, [string]$Relative, [switch]$AllowMissing) {
   if (-not $Relative -or $Relative.Contains('\') -or $Relative.Contains(':') -or $Relative.StartsWith('/') -or @($Relative.Split('/') | Where-Object { -not $_ -or $_ -eq '.' -or $_ -eq '..' }).Count) { throw 'Invalid archive manifest path.' }
   $full = [IO.Path]::GetFullPath((Join-Path $Root $Relative))
   if (-not $full.StartsWith($Root.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Archive path escapes installation.' }
+  $ancestor = [IO.DirectoryInfo]::new([IO.Path]::GetDirectoryName($full))
+  while ($ancestor) {
+    if ($ancestor.Exists -and ($ancestor.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Archive ancestor is redirected: $Relative" }
+    $ancestor = $ancestor.Parent
+  }
+  if ($AllowMissing -and -not (Test-Path -LiteralPath $full)) { return $null }
   $item = Get-Item -LiteralPath $full -Force
   if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Archive file is redirected: $Relative" }
   $parent = $item.Directory
@@ -101,8 +107,8 @@ try {
       if ($manifest.distribution -ne 'mcode-bun') { continue }
       $shimHashes += $manifest.files.'runtime/command-shim.exe'.sha256
       foreach ($entry in $manifest.files.PSObject.Properties) {
-        $file = Verify-File $release.FullName $entry.Name
-        if ((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -ieq $entry.Value.sha256) { $ownedPayloads += $file }
+        $file = Verify-File $release.FullName $entry.Name -AllowMissing
+        if ($file -and (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -ieq $entry.Value.sha256) { $ownedPayloads += $file }
       }
     }
     foreach ($name in @('mcode.exe','mcode-tools.exe')) {
@@ -121,8 +127,8 @@ try {
       $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
       if ($manifest.distribution -ne 'mcode-bun') { continue }
       foreach ($entry in $manifest.files.PSObject.Properties) {
-        $file = Verify-File $release.FullName $entry.Name
-        if ($ownedPayloads -contains $file) { Remove-Item -LiteralPath $file }
+        $file = Verify-File $release.FullName $entry.Name -AllowMissing
+        if ($file -and $ownedPayloads -contains $file) { Remove-Item -LiteralPath $file }
       }
       Remove-Item -LiteralPath $manifestPath
       Get-ChildItem -LiteralPath $release.FullName -Recurse -Directory | Sort-Object { $_.FullName.Length } -Descending | ForEach-Object { if (-not @(Get-ChildItem -LiteralPath $_.FullName -Force).Count) { [IO.Directory]::Delete($_.FullName) } }
@@ -172,10 +178,32 @@ try {
   $releaseRoot = Join-Path $InstallRoot 'releases'
   [IO.Directory]::CreateDirectory($releaseRoot) | Out-Null
   $target = Join-Path $releaseRoot $key
-  if (Test-Path -LiteralPath $target) { Verify-Archive $target | Out-Null } else { [IO.Directory]::Move($staging, $target); $staging = $null }
+  if (Test-Path -LiteralPath $target) {
+    try { Verify-Archive $target | Out-Null }
+    catch {
+      # Repair into a fresh immutable directory. Keep damaged/changed files and
+      # active executables intact; selection switches only after validation.
+      $key = $manifest.release + '-' + [Guid]::NewGuid().ToString('N').Substring(0, 16)
+      $target = Join-Path $releaseRoot $key
+      [IO.Directory]::Move($staging, $target); $staging = $null
+    }
+  } else { [IO.Directory]::Move($staging, $target); $staging = $null }
   [IO.Directory]::CreateDirectory($bin) | Out-Null
   $shim = Join-Path $target 'runtime/command-shim.exe'
   $shimHash = (Get-FileHash -LiteralPath $shim -Algorithm SHA256).Hash
+  $ownedShimHashes = @($shimHash)
+  foreach ($installed in @(Get-ChildItem -LiteralPath $releaseRoot -Directory)) {
+    $installedManifest = Join-Path $installed.FullName 'manifest.json'
+    if (-not (Test-Path -LiteralPath $installedManifest)) { continue }
+    $installedManifest = Verify-File $installed.FullName 'manifest.json'
+    $record = Get-Content -LiteralPath $installedManifest -Raw | ConvertFrom-Json
+    if ($record.distribution -ne 'mcode-bun' -or $record.schemaVersion -ne 1) { continue }
+    $recordedShim = Join-Path $installed.FullName 'runtime/command-shim.exe'
+    if (-not (Test-Path -LiteralPath $recordedShim)) { continue }
+    $recordedShim = Verify-File $installed.FullName 'runtime/command-shim.exe'
+    $recordedHash = (Get-FileHash -LiteralPath $recordedShim -Algorithm SHA256).Hash
+    if ($recordedHash -ieq $record.files.'runtime/command-shim.exe'.sha256) { $ownedShimHashes += $recordedHash }
+  }
   foreach ($command in @('mcode', 'mcode-tools')) {
     foreach ($extension in @('.cmd', '.ps1', '.bat')) {
       if (Test-Path -LiteralPath (Join-Path $bin ($command + $extension))) { throw 'Refusing an unrelated script that could shadow the native command.' }
@@ -183,7 +211,7 @@ try {
     $file = Join-Path $bin ($command + '.exe')
     if (Test-Path -LiteralPath $file) {
       Verify-File $InstallRoot ('bin/' + $command + '.exe') | Out-Null
-      if ((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -ine $shimHash) { throw "Refusing a changed or unrelated native command: $file" }
+      if ($ownedShimHashes -notcontains (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash) { throw "Refusing a changed or unrelated native command: $file" }
     } else { [IO.File]::Copy($shim, $file) }
   }
   # Atomic routing change is last; existing payloads and processes are retained.

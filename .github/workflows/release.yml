@@ -78,7 +78,7 @@ jobs:
           curl --fail --location --silent --show-error "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_${{ matrix.scanner }}" -o ".build/scanner/download.${{ runner.os == 'Windows' && 'zip' || 'tar.gz' }}"
           tar -xf ".build/scanner/download.${{ runner.os == 'Windows' && 'zip' || 'tar.gz' }}" -C .build/scanner
           if [ "${{ runner.os }}" = Windows ]; then scanner=.build/scanner/gitleaks.exe; else scanner=.build/scanner/gitleaks; fi
-          "$scanner" git . --redact --no-banner
+          "$scanner" git . --config .gitleaks.toml --redact --no-banner
           candidate=$(bun -e 'console.log(JSON.parse(await Bun.file(".build/latest.json").text()).output)')
           "$scanner" dir "$candidate" --config .gitleaks.toml --redact --no-banner
       - uses: actions/upload-artifact@v4

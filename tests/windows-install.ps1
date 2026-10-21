@@ -58,6 +58,15 @@ try {
   $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
   Assert (@($userPath -split ';' | Where-Object { $_.TrimEnd('\') -ieq $bin }).Count -eq 1) 'User PATH duplicated installation bin.'
   Write-Output 'PASS idempotent-install-and-path-registration'
+  $damagedRoot = Join-Path (Join-Path $root 'releases') $selected
+  $damagedFile = Join-Path $damagedRoot 'runtime/sqlite.cjs'
+  [IO.File]::WriteAllText($damagedFile, 'preserve changed payload')
+  Install @('-ArchivePath', $ArchivePath) | Out-Null
+  $repaired = Selection
+  Assert ($repaired -cne $selected) 'Repair did not select a fresh immutable payload.'
+  Assert (([IO.File]::ReadAllText($damagedFile)) -ceq 'preserve changed payload') 'Repair overwrote changed files.'
+  $selected = $repaired
+  Write-Output 'PASS repair-damaged-installation-without-overwriting-old-files'
   $beforePath = [Environment]::GetEnvironmentVariable('Path', 'User')
   $corrupt = Join-Path $scratch 'corrupt.zip'; [IO.File]::WriteAllText($corrupt, 'corrupt')
   Copy-Item -LiteralPath ($ArchivePath + '.sha256') -Destination ($corrupt + '.sha256')
@@ -140,6 +149,7 @@ try {
   Assert (@([Environment]::GetEnvironmentVariable('Path','User') -split ';' | Where-Object { $_.TrimEnd('\') -ieq $bin }).Count -eq 0) 'Uninstall retained User PATH entry.'
   Assert (([IO.File]::ReadAllText($external)) -ceq 'preserve-external') 'Uninstall changed external data.'
   Assert (([IO.File]::ReadAllText((Join-Path $data 'sessions-sentinel'))) -ceq 'preserve-sessions') 'Uninstall changed sessions.'
+  Assert (([IO.File]::ReadAllText($damagedFile)) -ceq 'preserve changed payload') 'Uninstall removed a changed payload file.'
   Write-Output 'PASS hostile-uninstall-manifest-refusal-and-owned-uninstall-preservation'
   Write-Output 'Windows installer: all cases passed'
 } finally {
