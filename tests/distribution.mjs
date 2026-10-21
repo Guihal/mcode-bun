@@ -46,7 +46,17 @@ await check('relocated-version-help-invalid-option-without-system-runtime', () =
 });
 await check('payload-hashes-no-links-source-drift-refusal', () => {
   assert.equal(fs.readFileSync(cli).includes(Buffer.from(root)), false, 'compiled app must not embed its maintainer checkout path');
+  // Present in the pinned eager binary; now owned only by physical lazy modules.
+  for (const marker of ['Unknown help target. Valid help commands:', 'Read video file [', 'Cannot append to a finished output accumulator', 'Background Bash task accepted; command startup may still be in progress.']) assert.equal(fs.readFileSync(cli).includes(Buffer.from(marker)), false, 'cold implementation was bundled into the launcher: ' + marker);
   const manifest = JSON.parse(fs.readFileSync(path.join(relocated, 'manifest.json')));
+  const localModules = Object.keys(manifest.files).filter(name => name.startsWith('package/lazy-tools/'));
+  assert.equal(localModules.length, 28);
+  const capabilityModules = Object.keys(manifest.files).filter(name => name.startsWith('package/lazy-capabilities/'));
+  assert.equal(capabilityModules.length, 24);
+  assert.equal(new Set(localModules.map(name => name.toLowerCase())).size, localModules.length);
+  assert.equal(new Set(capabilityModules.map(name => name.toLowerCase())).size, capabilityModules.length);
+  for (const name of ['runtime/lazy-tool.mjs', ...localModules, ...capabilityModules]) assert.ok(manifest.required.includes(name), name + ' must be checked by the updater/runtime owner');
+  for (const marker of ['web_fetch request timed out.', 'website_deploy update_archive returned an invalid success response.', 'The requested window is no longer in the current application window inventory.']) assert.equal(fs.readFileSync(cli).includes(Buffer.from(marker)), false, marker + ' must stay in physical capability modules');
   for (const [name, expected] of Object.entries(manifest.files)) {
     const file = path.join(relocated, ...name.split('/'));
     assert.equal(fs.lstatSync(file).isSymbolicLink(), false);
@@ -59,25 +69,30 @@ await check('payload-hashes-no-links-source-drift-refusal', () => {
   assert.throws(() => inventory(unknown), /Unclassified executable graph/);
 });
 await check('incomplete-archive-fails-before-cli-routing', () => {
-  const wasm = path.join(relocated, 'package', 'photon_rs_bg.wasm'), saved = wasm + '.saved';
-  fs.renameSync(wasm, saved);
-  try { const r = invoke(cli, ['--version']); assert.notEqual(r.status, 0); assert.match(r.stderr, /Incomplete or corrupt.*photon_rs_bg.wasm/); }
-  finally { fs.renameSync(saved, wasm); }
+  for (const name of ['photon_rs_bg.wasm', 'image-resize-worker.js', 'lazy-tools/local-00.mjs', 'lazy-tools/base-read.mjs', 'lazy-tools/cron.mjs', 'lazy-tools/self_reminder.mjs', 'lazy-capabilities/browser.mjs', 'lazy-capabilities/computer.mjs', 'lazy-capabilities/goal-0.mjs', 'lazy-capabilities/matrix-0.mjs', 'lazy-capabilities/fetch.mjs', 'lazy-capabilities/deploy.mjs']) {
+    const file = path.join(relocated, 'package', name), saved = file + '.saved';
+    fs.renameSync(file, saved);
+    try { const r = invoke(cli, ['--version']); assert.notEqual(r.status, 0); assert.match(r.stderr, /Incomplete or corrupt/); assert.ok(r.stderr.includes(name)); }
+    finally { fs.renameSync(saved, file); }
+  }
 });
 await check('same-size-resource-corruption-fails-before-cli-routing', () => {
-  const wasm = path.join(relocated, 'package', 'photon_rs_bg.wasm'), original = fs.readFileSync(wasm);
-  const corrupt = Buffer.from(original); corrupt[0] ^= 255; fs.writeFileSync(wasm, corrupt);
-  try { const r = invoke(cli, ['--version']); assert.notEqual(r.status, 0); assert.match(r.stderr, /Incomplete or corrupt.*photon_rs_bg.wasm/); }
-  finally { fs.writeFileSync(wasm, original); }
+  for (const name of ['photon_rs_bg.wasm', 'image-resize-worker.js', 'lazy-tools/local-00.mjs', 'lazy-tools/base-read.mjs', 'lazy-tools/cron.mjs', 'lazy-tools/self_reminder.mjs', 'lazy-capabilities/browser.mjs', 'lazy-capabilities/computer.mjs', 'lazy-capabilities/goal-0.mjs', 'lazy-capabilities/matrix-0.mjs', 'lazy-capabilities/fetch.mjs', 'lazy-capabilities/deploy.mjs']) {
+    const file = path.join(relocated, 'package', name), original = fs.readFileSync(file);
+    const corrupt = Buffer.from(original); corrupt[0] ^= 255; fs.writeFileSync(file, corrupt);
+    try { const r = invoke(cli, ['--version']); assert.notEqual(r.status, 0); assert.match(r.stderr, /Incomplete or corrupt/); assert.ok(r.stderr.includes(name)); }
+    finally { fs.writeFileSync(file, original); }
+  }
 });
 
 // Compile the same transformed implementations with temporary private exports.
 // Production archive bytes above are checked before any test instrumentation.
 const extras = {
-  'chunks/chunk-5ADYFF2U.js': 'export {uGt as toolsHost,X_t as optional,BUt as matrix,wGr as miniApp,l4e as seedTrash,hN as trashProbe};',
-  'chunks/chunk-47KWM23C.js': 'export {bpe as windowsTrash};',
+  'chunks/chunk-5ADYFF2U.js': 'export {uGt as toolsHost,X_t as optional,BUt as matrix,wGr as miniApp,l4e as seedTrash,hN as trashProbe,Tfr as tokenCountRequest};',
+  'chunks/chunk-47KWM23C.js': 'export {ygi as localTools,Inr as providerPayload};',
   'chunks/launcher-AVQRYDKB.js': 'export {k2 as image};',
   'chunks/chunk-VAVHH4XP.js': 'export {le as clipboard};',
+  'chunks/chunk-GMLXHJYG.js': 'export const imageRuntimeLoaded=()=>I!==null||k!==null;',
 };
 for (const [name, extra] of Object.entries(extras)) fs.appendFileSync(path.join(relocated, 'package', name), '\n' + extra);
 // Generate a tiny deterministic PNG, without external image tools.
@@ -103,12 +118,41 @@ const pass=async(name,fn)=>{await fn();console.log('PASS '+name)};
 if(process.argv[2]==='parent-death'){
  const op=operations({parentDeathGuard:true});await op.exec(process.platform==='win32'?'Write-Output $PID; Start-Sleep 40':'printf "%s\\n" "$$"; exec sleep 40',dir,{onData:bytes=>{const pid=Number(bytes.toString().trim());if(pid>0)fs.writeFileSync(path.join(dir,'death-pid'),String(pid))}});process.exit(0);
 }
+await pass('compiled-provider-priority-overrides-and-body-limit',async()=>{
+ const{providerPayload}=await import('./package/chunks/chunk-47KWM23C.js');
+ for(const api of ['anthropic-messages','openai-completions','openai-responses']){
+  for(const prior of [undefined,'auto','default']){
+   const payload={model:'probe',messages:[],...(prior?{service_tier:prior}:{})};
+   const result=await providerPayload({payload,model:{api,id:'probe'},thinkingRequestPatch:{service_tier:'default'}});
+   assert.equal(result,payload);assert.equal(result.service_tier,'priority');
+  }
+ }
+ for(const payload of [null,undefined,[],42,'text'])assert.equal(await providerPayload({payload,model:{api:'openai-responses'}}),undefined);
+ const base={model:'probe',messages:[]},limit=Buffer.byteLength(JSON.stringify(base));
+ await assert.rejects(()=>providerPayload({payload:{...base},model:{api:'openai-responses'},maxRequestBodyBytes:limit}),e=>e.code==='REQUEST_BODY_TOO_LARGE');
+ const final={...base,service_tier:'priority'};
+ assert.deepEqual(await providerPayload({payload:{...base},model:{api:'openai-responses'},maxRequestBodyBytes:Buffer.byteLength(JSON.stringify(final))}),final);
+ for(const preparedPayload of [undefined,{model:'probe',messages:[],service_tier:'auto'}]){
+  const request=runtime.tokenCountRequest({model:{api:'anthropic-messages',id:'probe',input:['text'],baseUrl:'http://127.0.0.1',maxTokens:4096},messages:[],preparedPayload});
+  assert.equal(request.body.service_tier,'priority');
+ }
+});
 await pass('compiled-physical-package-native-clipboard-lazy-optional',async()=>{
  const api=await clipboard();assert.equal(typeof api.hasImage,'function');assert.equal(typeof api.getImageBinary,'function');
  await assert.rejects(()=>runtime.optional({}),e=>/Cannot find (package|module)/.test(e.message)&&e.message.includes('@larksuiteoapi/node-sdk'));
  assert.equal(runtime.miniApp({}).execPath,privateBun);assert.throws(()=>runtime.matrix({workspaceDir:dir}),/entrypoint is unavailable/);
 });
 await pass('compiled-image-worker-and-wasm',async()=>{const output=await launcher.image(fs.readFileSync(path.join(dir,'image.png')),'image/png',16,new AbortController().signal);const png=Buffer.from(output,'base64');assert.equal(png.readUInt32BE(16),16);assert.equal(png.readUInt32BE(20),8)});
+await pass('compiled-relocated-physical-native-tool-first-use',async()=>{
+ const {localTools}=await import('./package/chunks/chunk-47KWM23C.js'),tools=localTools({workspaceRoot:dir});
+ fs.writeFileSync(path.join(dir,'local-tool.txt'),'lazy-tool-ok');
+ const result=await tools.get('read').impl.execute({sessionId:'fixture',turnId:'fixture'},{path:'local-tool.txt'});assert.match(result.text,/lazy-tool-ok/);
+ const canceled=new AbortController();canceled.abort();await assert.rejects(tools.get('write').impl.execute({}, {path:'canceled-local.txt',content:'never'}, canceled.signal),/Operation aborted/);assert.equal(fs.existsSync(path.join(dir,'canceled-local.txt')),false);
+});
+await pass('compiled-physical-resize-worker-and-parent-runtime-isolation',async()=>{
+ const image=await import('./package/chunks/chunk-GMLXHJYG.js'),bytes=fs.readFileSync(path.join(dir,'image.png')),saved=Buffer.from(bytes);
+ const result=await image.b(bytes,'image/png',{maxWidth:16,maxHeight:16});assert.equal(result.width,16);assert.equal(result.height,8);assert.equal(result.mimeType,'image/png');assert.deepEqual(bytes,saved);assert.equal(image.imageRuntimeLoaded(),false);
+});
 await pass('compiled-managed-shell-success-failure-timeout-cancellation',async()=>{
  const op=operations({parentDeathGuard:true}),tool=shellTool(dir,{operations:op});
  const result=await tool.execute('fixture',{command:process.platform==='win32'?"Write-Output 'guardian-ok'":'printf guardian-ok',timeout:5});assert.equal(result.details.execution.status,'succeeded');assert.match(result.content[0].text,/guardian-ok/);
@@ -132,8 +176,8 @@ await pass('real-compiled-restart-arguments-and-pending-journal-isolation',async
 });
 if(process.platform==='win32')await pass('windows-trash-probe-recycle-outside-protected-refusal',async()=>{
  const data=path.join(dir,'trash-data');runtime.seedTrash(data);assert.equal(runtime.trashProbe(data).available,true);
- const{windowsTrash}=await import('./package/chunks/chunk-47KWM23C.js');const target=path.join(dir,'recycle-me.txt');fs.writeFileSync(target,'fixture');
- const call=targets=>windowsTrash({runtime:{platform:'win32',scriptPath:path.join(data,'bin','mavis-trash.js'),readExecution:()=>({targets})},toolInput:{command:'mavis-trash --'},workspaceRoot:dir,timeoutSeconds:20});
+ const{localTools}=await import('./package/chunks/chunk-47KWM23C.js');const target=path.join(dir,'recycle-me.txt');fs.writeFileSync(target,'fixture');
+ const call=targets=>localTools({workspaceRoot:dir,hostTrashRuntime:{platform:'win32',scriptPath:path.join(data,'bin','mavis-trash.js'),readExecution:()=>({targets})}}).get('bash').impl.execute({sessionId:'fixture'}, {command:'mavis-trash --',timeout:20,description:'fixture recycle'});
  const ok=await call([target]);assert.equal(ok.isError,undefined,ok.text);assert.equal(fs.existsSync(target),false);
  const outside=path.join(root,'outside-sentinel');fs.writeFileSync(outside,'safe');assert.equal((await call([outside])).details.status,'windows_trash_target_rejected');assert.equal(fs.readFileSync(outside,'utf8'),'safe');
  assert.equal((await call([process.env.SystemRoot])).details.status,'windows_trash_target_rejected');

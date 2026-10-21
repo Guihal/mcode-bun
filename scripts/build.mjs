@@ -5,6 +5,14 @@ import { fileURLToPath } from 'node:url';
 import { isBuiltin } from 'node:module';
 import { spawnSync } from 'node:child_process';
 import { repair } from './retry-repair.mjs';
+import { repairSharedMcp } from './shared-mcp-repair.mjs';
+import { repairMcpRegistry } from './mcp-registry-repair.mjs';
+import { repairEditorMemory } from './editor-memory-repair.mjs';
+import { repairHistoryMemory } from './history-memory-repair.mjs';
+import { repairImageMemory } from './image-memory-repair.mjs';
+import { repairStartupMemory } from './startup-memory-repair.mjs';
+import { repairLazyTools } from './lazy-tools-repair.mjs';
+import { repairLazyCapabilities } from './lazy-capabilities-repair.mjs';
 
 export const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const metadata = JSON.parse(fs.readFileSync(path.join(root, 'package.json')));
@@ -231,7 +239,7 @@ function resolve(){
 module.exports={resolve};
 `;
 
-export function transform(name, source) {
+export function transform(name, source, resources) {
   // The embedded tools manifest hashes the original CLI, including its shebang.
   // It is interpreted by the private Bun and must remain byte-for-byte intact.
   if (name.startsWith('embedded/')) return source;
@@ -242,16 +250,31 @@ export function transform(name, source) {
     // diagnostic stack filtering. Keep that module identity archive-relative.
     s = exact(s, portableHeader, portableHeader + ` const __filename=__mavis_join(__mavis_tuiPackageRoot,'chunks','chunk-KTNHM6NK.js');`);
   }
+  if (name === 'chunks/chunk-U5SHMJ7Y.js') {
+    // Auxiliary calls can omit the application's payload transform entirely.
+    s = exact(s, 'a.messages.create({...l,stream:!0},m)', 'a.messages.create({...l,stream:!0,service_tier:"priority"},m)');
+  }
+  if (name === 'chunks/chunk-GMLXHJYG.js') {
+    s = repairImageMemory(source).replace(/^#![^\n]*\n/, '');
+    s = exact(s, header, portableHeader);
+  }
   if (name === 'chunks/chunk-47KWM23C.js') {
     // Retry repair must see the pristine request owner, before any other edit.
-    s = repair(source).replace(/^#![^\n]*\n/, '');
+    s = repairHistoryMemory(repair(source)).replace(/^#![^\n]*\n/, '');
     s = exact(s, header, portableHeader);
+    // Apply after configured payload patches and before the body-size guard.
+    // This owner serves agent, checkpoint and auxiliary generation requests.
+    s = exact(s, 'return knr(e.payload,e.maxRequestBodyBytes),t||n||r?e.payload:void 0', 'return e.payload.service_tier="priority",knr(e.payload,e.maxRequestBodyBytes),e.payload');
     s = exact(s, 'import C5 from"better-sqlite3"', 'import C5 from"../../runtime/sqlite.cjs"');
     s = exact(s, '("better-sqlite3")', '(__mavis_join(__mavis_tuiPackageRoot,"..","runtime","sqlite.cjs"))', 3);
     s = exact(s, 'auto:["pwsh","windows-powershell","git-bash"]', 'auto:["windows-powershell","pwsh","git-bash"]');
     s = exact(s, 'launcher:process.execPath,argv:[t.scriptPath', 'launcher:__mcodeRuntime,argv:[t.scriptPath');
   }
   if (name === 'chunks/chunk-5ADYFF2U.js') {
+    s = repairSharedMcp(s);
+    s = repairMcpRegistry(s);
+    // Token counting builds a separate body, including its prepared-payload path.
+    s = exact(s, 'unsupportedCacheKey:`messages:${i}`,body:s,headers:', 'unsupportedCacheKey:`messages:${i}`,body:{...s,service_tier:"priority"},headers:');
     s = exact(s, '("better-sqlite3")', '(__mavis_join(__mavis_tuiPackageRoot,"..","runtime","sqlite.cjs"))', 2);
     s = exact(s, 'import("@larksuiteoapi/node-sdk")', 'import(import.meta.resolve("@larksuiteoapi/node-sdk",__mavis_tuiPackageEntryUrl))', 2);
     for (const [from, to] of [
@@ -268,6 +291,8 @@ export function transform(name, source) {
     s = exact(s, 'Vu(process.execPath,["--input-type=module","--eval",hj', 'Vu(__mcodeRuntime,["--input-type=module","--eval",hj');
   }
   if (name === 'chunks/launcher-AVQRYDKB.js') {
+    s = repairEditorMemory(source).replace(/^#![^\n]*\n/, '');
+    s = exact(s, header, portableHeader);
     s = exact(s, 'let s=aK(n),r=e.slice(s?2:1)', 'let s=aK(n),compiled=!s&&e[1]===__mavis_join(__mavis_tuiPackageRoot,"cli.js"),r=e.slice(s||compiled?2:1)');
   }
   if (name === 'chunks/chunk-DCFP5ZHZ.js') {
@@ -281,11 +306,12 @@ export function transform(name, source) {
   if (name === 'chunks/run-app-server-command-DEX4FRZJ.js') {
     s = exact(s, 'async function Hs(t,e,r={}){', 'async function Hs(t,e,r={}){if(t.mode==="daemon"&&t.daemonAction==="update-loop")throw Error(__mcodeManualUpdate);r={resolveOfficialInstallation:()=>__mcodeInstallation(),prepareServerInstallation:async(d,i,p)=>{if(p==="win32")throw Error("The app-server daemon requires a Unix-like remote host.");return __mcodeInstallation()},resolveServerInstallation:()=>__mcodeInstallation(),managedUpdaterEnabled:!1,...r};');
   }
-  return s;
+  return repairLazyCapabilities(name, repairLazyTools(name, repairStartupMemory(name, s), resources), resources);
 }
 
 export function compile(entry, output, options = {}) {
   const extra = options.target ? [`--target=${options.target}`, `--compile-executable-path=${options.executablePath}`] : [];
+  if (options.bytecodeOrder) extra.push(`--bytecode-order=${options.bytecodeOrder}`);
   console.log(run(process.execPath, ['build', entry, '--compile', '--bytecode', '--format=esm', '--define', '__MCODE_COMPILED__=true', ...extra, '--outfile', output]).trim());
 }
 
@@ -421,10 +447,17 @@ export async function build() {
   const output = path.join(directory, release);
   fs.mkdirSync(path.join(output, 'runtime'), { recursive: true });
   fs.cpSync(pkg, path.join(output, 'package'), { recursive: true, dereference: false });
+  const localToolResources = {};
   for (const file of files(path.join(output, 'package'))) {
     const name = path.relative(path.join(output, 'package'), file).replaceAll(path.sep, '/');
-    if (/\.(?:[cm]?js)$/.test(name) && !name.startsWith('assets/') && name !== 'verify-native-install.mjs') fs.writeFileSync(file, transform(name, fs.readFileSync(file, 'utf8')));
+    if (/\.(?:[cm]?js)$/.test(name) && !name.startsWith('assets/') && name !== 'verify-native-install.mjs') fs.writeFileSync(file, transform(name, fs.readFileSync(file, 'utf8'), localToolResources));
   }
+  for (const [name, source] of Object.entries(localToolResources)) {
+    const file = path.join(output, 'package', name);
+    fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, source);
+  }
+  fs.copyFileSync(path.join(root, 'runtime', 'lazy-tool.mjs'), path.join(output, 'runtime', 'lazy-tool.mjs'));
+  fs.copyFileSync(path.join(root, 'runtime', 'image-resize-worker.mjs'), path.join(output, 'package', 'image-resize-worker.js'));
   let dependencyRoot = root;
   if (targetPlatform !== process.platform) {
     dependencyRoot = path.join(directory, 'dependencies'); fs.mkdirSync(dependencyRoot);
@@ -446,6 +479,7 @@ export async function build() {
   else fs.copyFileSync(process.execPath, privateRuntime);
   const compileOptions = windows ? { target: 'bun-windows-x64-baseline', executablePath: privateRuntime } : {};
   fs.copyFileSync(path.join(root, 'runtime', 'sqlite.cjs'), path.join(output, 'runtime', 'sqlite.cjs'));
+  fs.copyFileSync(path.join(root, 'runtime', 'shared-mcp.cjs'), path.join(output, 'runtime', 'shared-mcp.cjs'));
   fs.writeFileSync(path.join(output, 'runtime', 'installation.cjs'), installationSource);
   const bootstrap = path.join(directory, 'bootstrap.mjs');
   fs.writeFileSync(bootstrap, `import path from 'node:path'; import {createRequire} from 'node:module';const root=path.dirname(process.execPath);createRequire(path.join(root,'package','cli.js'))(path.join(root,'runtime','installation.cjs')).resolve();process.argv.splice(1,1,path.join(root,'package','cli.js'));await import('./${release}/package/cli.js');`);
@@ -468,9 +502,27 @@ try{
   } else fs.writeFileSync(path.join(output, 'mcode-tools'), '#!/bin/sh\nset -eu\nroot=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)\nexec "$root/runtime/bun" "$root/package/mcode-tools.js" "$@"\n', { mode: 0o755 });
   for (const name of ['README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'install.ps1']) fs.copyFileSync(path.join(root, name), path.join(output, name));
   await copyLicenses(output);
-  const manifest = { schemaVersion: 1, distribution: 'mcode-bun', release: metadata.version, upstreamVersion: pin.upstreamVersion, bunVersion: pin.bunVersion, target: `${targetPlatform}-${process.arch}`, files: {}, required: [executableName, `runtime/${windows ? 'bun.exe' : 'bun'}`, 'runtime/sqlite.cjs', 'package/cli.js', 'package/package.json', 'package/image-preview-worker.js', 'package/photon_rs_bg.wasm', 'package/embedded/mcode-tools/cli.mjs'] };
+  const manifest = { schemaVersion: 1, distribution: 'mcode-bun', release: metadata.version, upstreamVersion: pin.upstreamVersion, bunVersion: pin.bunVersion, target: `${targetPlatform}-${process.arch}`, files: {}, required: [executableName, `runtime/${windows ? 'bun.exe' : 'bun'}`, 'runtime/sqlite.cjs', 'runtime/shared-mcp.cjs', 'package/cli.js', 'package/package.json', 'package/image-preview-worker.js', 'package/image-resize-worker.js', 'package/photon_rs_bg.wasm', 'package/embedded/mcode-tools/cli.mjs'] };
+  manifest.required.push('runtime/lazy-tool.mjs', ...Object.keys(localToolResources).map(name => 'package/' + name));
   for (const file of files(output)) manifest.files[path.relative(output, file).replaceAll(path.sep, '/')] = { size: fs.statSync(file).size, sha256: sha256(fs.readFileSync(file)) };
   fs.writeFileSync(path.join(output, 'manifest.json'), JSON.stringify(manifest, null, 2));
+  if (targetPlatform === 'linux' && targetPlatform === process.platform) {
+    // Train on owned startup and useful work, never on a personal session/profile.
+    // Keep cross-target/Windows builds on the existing full-depth layout.
+    const startupOrder = path.join(directory, 'startup.order');
+    run(path.join(output, executableName), ['--help'], { env: { ...process.env, BUN_BYTECODE_ORDER_OUT: startupOrder } });
+    const profile = run(process.execPath, [path.join(root, 'tests', 'native-retry.mjs'), path.join(output, executableName), 'recover'], {
+      env: { ...process.env, MCODE_TEST_TMP: directory, BUN_BYTECODE_ORDER_OUT: path.join(directory, 'useful-%p.order') },
+    });
+    const pid = JSON.parse(profile).memory.phases[0]?.pid;
+    if (!Number.isInteger(pid) || pid <= 0) throw Error('Useful-work bytecode profile has no CLI process identity');
+    const usefulOrder = path.join(directory, `useful-${pid}.order`);
+    for (const file of [startupOrder, usefulOrder]) if (!fs.statSync(file).isFile() || !fs.statSync(file).size) throw Error('Missing bytecode profile: ' + file);
+    compile(bootstrap, path.join(output, executableName), { ...compileOptions, bytecodeOrder: [usefulOrder, startupOrder].join(',') });
+    const executable = path.join(output, executableName);
+    manifest.files[executableName] = { size: fs.statSync(executable).size, sha256: sha256(fs.readFileSync(executable)) };
+    fs.writeFileSync(path.join(output, 'manifest.json'), JSON.stringify(manifest, null, 2));
+  }
   if (targetPlatform === process.platform) run(path.join(output, executableName), ['--version']);
   if (windows) for (const relative of [executableName, 'runtime/bun.exe', 'runtime/command-shim.exe', `package/node_modules/${clipboardName}/clipboard.win32-x64-msvc.node`, `package/node_modules/${ripgrepName}/bin/rg.exe`]) {
     const bytes = fs.readFileSync(path.join(output, relative)), pe = bytes.readUInt32LE(0x3c);
