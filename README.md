@@ -25,7 +25,7 @@ remain optional shell choices.
 
 Local zip installation (keep its adjacent .sha256 file):
 
-    powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -ArchivePath .\mcode-0.6.12-bun.1-win32-x64.zip
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -ArchivePath .\mcode-0.6.12-bun.2-win32-x64.zip
     mcode --version
     mcode-tools --version
 

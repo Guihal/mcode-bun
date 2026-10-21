@@ -13,15 +13,20 @@ if ([Environment]::OSVersion.Platform -ne 'Win32NT' -or -not [Environment]::Is64
 if ([Environment]::OSVersion.Version.Build -lt 17763) { throw 'MCode Bun requires Windows 10 version 1809 or later.' }
 $InstallRoot = [IO.Path]::GetFullPath($InstallRoot)
 if ($InstallRoot -eq [IO.Path]::GetPathRoot($InstallRoot) -or $InstallRoot -eq $env:USERPROFILE -or $InstallRoot -eq $env:LOCALAPPDATA) { throw 'Refusing an unsafe installation root.' }
-$ancestor = $InstallRoot
-while ($ancestor) {
-  if (Test-Path -LiteralPath $ancestor) {
-    if ((Get-Item -LiteralPath $ancestor -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Installation ancestry must not be redirected.' }
+function Assert-UnredirectedPath([string]$Path) {
+  $ancestor = [IO.Path]::GetFullPath($Path)
+  while ($ancestor) {
+    $item = $null
+    try { $item = Get-Item -LiteralPath $ancestor -Force -ErrorAction Stop }
+    catch [System.Management.Automation.ItemNotFoundException] { }
+    if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Installation path must not be redirected: $ancestor" }
+    $parent = [IO.Directory]::GetParent($ancestor)
+    $ancestor = if ($parent) { $parent.FullName } else { $null }
   }
-  $parent = [IO.Directory]::GetParent($ancestor)
-  $ancestor = if ($parent) { $parent.FullName } else { $null }
 }
+Assert-UnredirectedPath $InstallRoot
 $ownerPath = Join-Path $InstallRoot '.mcode-bun-owner'
+Assert-UnredirectedPath $ownerPath
 $ownerValue = 'Guihal/mcode-bun;schema=1'
 if (Test-Path -LiteralPath $InstallRoot) {
   if ((Get-Item -LiteralPath $InstallRoot -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Installation root must not be redirected.' }
@@ -92,8 +97,9 @@ function Verify-Archive([string]$Root) {
   return $manifest
 }
 try {
-  Write-Utf8 $ownerPath $ownerValue
   $bin = Join-Path $InstallRoot 'bin'
+  foreach ($managed in @($ownerPath, $bin, (Join-Path $InstallRoot 'releases'), (Join-Path $InstallRoot 'current'))) { Assert-UnredirectedPath $managed }
+  Write-Utf8 $ownerPath $ownerValue
   if ($Uninstall) {
     # Only recorded payload paths and installer-authored routing are removed.
     # Unknown files are retained, including anything a user placed in this root.
@@ -148,6 +154,7 @@ try {
     $checksum = @($release.assets | Where-Object { $_.name -ceq ($assetName + '.sha256') })
     if ($asset.Count -ne 1 -or $checksum.Count -ne 1) { throw 'Release is missing the complete Windows distribution or checksum.' }
     $download = Join-Path $InstallRoot ('.download-' + [Guid]::NewGuid().ToString('N'))
+    Assert-UnredirectedPath $download
     [IO.Directory]::CreateDirectory($download) | Out-Null
     $ArchivePath = Join-Path $download $assetName; $ChecksumPath = $ArchivePath + '.sha256'
     Invoke-WebRequest -UseBasicParsing -Uri $asset[0].browser_download_url -OutFile $ArchivePath
@@ -159,6 +166,7 @@ try {
   if ($expectedHash -notmatch '^([0-9a-fA-F]{64})(?:\s+[^\r\n]+)?$') { throw 'Invalid SHA-256 checksum file.' }
   if ((Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash -ine $Matches[1]) { throw 'Archive checksum mismatch; previous installation remains selected.' }
   $staging = Join-Path $InstallRoot ('.staging-' + [Guid]::NewGuid().ToString('N'))
+  Assert-UnredirectedPath $staging
   [IO.Directory]::CreateDirectory($staging) | Out-Null
   Add-Type -AssemblyName System.IO.Compression.FileSystem
   $zip = [IO.Compression.ZipFile]::OpenRead($ArchivePath)
@@ -176,8 +184,10 @@ try {
   $manifest = Verify-Archive $staging
   $key = $manifest.release + '-' + (Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash.Substring(0, 16).ToLowerInvariant()
   $releaseRoot = Join-Path $InstallRoot 'releases'
+  Assert-UnredirectedPath $releaseRoot
   [IO.Directory]::CreateDirectory($releaseRoot) | Out-Null
   $target = Join-Path $releaseRoot $key
+  Assert-UnredirectedPath $target
   if (Test-Path -LiteralPath $target) {
     try { Verify-Archive $target | Out-Null }
     catch {
@@ -185,9 +195,11 @@ try {
       # active executables intact; selection switches only after validation.
       $key = $manifest.release + '-' + [Guid]::NewGuid().ToString('N').Substring(0, 16)
       $target = Join-Path $releaseRoot $key
+      Assert-UnredirectedPath $target
       [IO.Directory]::Move($staging, $target); $staging = $null
     }
   } else { [IO.Directory]::Move($staging, $target); $staging = $null }
+  Assert-UnredirectedPath $bin
   [IO.Directory]::CreateDirectory($bin) | Out-Null
   $shim = Join-Path $target 'runtime/command-shim.exe'
   $shimHash = (Get-FileHash -LiteralPath $shim -Algorithm SHA256).Hash
@@ -209,6 +221,7 @@ try {
       if (Test-Path -LiteralPath (Join-Path $bin ($command + $extension))) { throw 'Refusing an unrelated script that could shadow the native command.' }
     }
     $file = Join-Path $bin ($command + '.exe')
+    Assert-UnredirectedPath $file
     if (Test-Path -LiteralPath $file) {
       Verify-File $InstallRoot ('bin/' + $command + '.exe') | Out-Null
       if ($ownedShimHashes -notcontains (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash) { throw "Refusing a changed or unrelated native command: $file" }
@@ -216,6 +229,8 @@ try {
   }
   # Atomic routing change is last; existing payloads and processes are retained.
   $selection = Join-Path $InstallRoot 'current'; $next = Join-Path $InstallRoot ('.current-' + [Guid]::NewGuid().ToString('N'))
+  Assert-UnredirectedPath $selection
+  Assert-UnredirectedPath $next
   Write-Utf8 $next ($key + "`n")
   $oldUserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
   $oldProcessPath = [Environment]::GetEnvironmentVariable('Path', 'Process')

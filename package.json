@@ -1,6 +1,6 @@
 {
   "name": "mcode-bun-distribution",
-  "version": "0.6.12-bun.1",
+  "version": "0.6.12-bun.2",
   "private": true,
   "type": "module",
   "license": "MIT",

@@ -58,6 +58,30 @@ try {
   $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
   Assert (@($userPath -split ';' | Where-Object { $_.TrimEnd('\') -ieq $bin }).Count -eq 1) 'User PATH duplicated installation bin.'
   Write-Output 'PASS idempotent-install-and-path-registration'
+  # Missing command destinations must not bypass linked-parent checks. Likewise,
+  # release moves must never follow a pre-existing releases directory junction.
+  foreach ($managedName in @('bin', 'releases')) {
+    $managed = Join-Path $root $managedName
+    $saved = Join-Path $root ($managedName + '-saved')
+    $outside = Join-Path $scratch ('outside-' + $managedName)
+    [IO.Directory]::CreateDirectory($outside) | Out-Null
+    [IO.File]::WriteAllText((Join-Path $outside 'sentinel'), 'preserve-junction-target')
+    [IO.Directory]::Move($managed, $saved)
+    try {
+      New-Item -ItemType Junction -Path $managed -Target $outside | Out-Null
+      Install @('-ArchivePath', $ArchivePath) $true | Out-Null
+      Install @('-Uninstall') $true | Out-Null
+      Check-Preservation $selected
+      Assert ([Environment]::GetEnvironmentVariable('Path', 'User') -ceq $userPath) 'Junction rejection changed PATH.'
+      Assert (@(Get-ChildItem -LiteralPath $outside -Force).Count -eq 1) 'Installer wrote into a junction target.'
+      Assert (([IO.File]::ReadAllText((Join-Path $outside 'sentinel'))) -ceq 'preserve-junction-target') 'Installer changed a junction target.'
+    } finally {
+      # Directory.Delete removes the junction itself, never its external target.
+      if (Test-Path -LiteralPath $managed) { [IO.Directory]::Delete($managed) }
+      [IO.Directory]::Move($saved, $managed)
+    }
+  }
+  Write-Output 'PASS bin-and-releases-junction-refusal-with-external-preservation'
   $damagedRoot = Join-Path (Join-Path $root 'releases') $selected
   $damagedFile = Join-Path $damagedRoot 'runtime/sqlite.cjs'
   [IO.File]::WriteAllText($damagedFile, 'preserve changed payload')
