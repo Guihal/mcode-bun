@@ -237,6 +237,11 @@ export function transform(name, source) {
   if (name.startsWith('embedded/')) return source;
   let s = source.replace(/^#![^\n]*\n/, '');
   if (name.endsWith('.js') && !name.startsWith('embedded/')) s = exact(s, header, portableHeader);
+  if (name === 'chunks/chunk-KTNHM6NK.js') {
+    // Bun otherwise injects the build host's absolute __filename for Undici's
+    // diagnostic stack filtering. Keep that module identity archive-relative.
+    s = exact(s, portableHeader, portableHeader + ` const __filename=__mavis_join(__mavis_tuiPackageRoot,'chunks','chunk-KTNHM6NK.js');`);
+  }
   if (name === 'chunks/chunk-47KWM23C.js') {
     // Retry repair must see the pristine request owner, before any other edit.
     s = repair(source).replace(/^#![^\n]*\n/, '');

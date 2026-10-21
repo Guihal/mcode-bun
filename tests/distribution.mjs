@@ -45,6 +45,7 @@ await check('relocated-version-help-invalid-option-without-system-runtime', () =
   assert.equal(good(bun, [path.join(relocated, 'package', 'mcode-tools.js'), '--version']), '0.0.6');
 });
 await check('payload-hashes-no-links-source-drift-refusal', () => {
+  assert.equal(fs.readFileSync(cli).includes(Buffer.from(root)), false, 'compiled app must not embed its maintainer checkout path');
   const manifest = JSON.parse(fs.readFileSync(path.join(relocated, 'manifest.json')));
   for (const [name, expected] of Object.entries(manifest.files)) {
     const file = path.join(relocated, ...name.split('/'));
